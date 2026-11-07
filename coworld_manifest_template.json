@@ -24,7 +24,7 @@
         "/bin/chorus"
       ],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-chorus/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-chorus/tree/main"
     },
     "config_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -339,7 +339,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-chorus/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-chorus/tree/main"
     },
     {
       "id": "chorus-arpeggio",
@@ -362,7 +362,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-chorus/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-chorus/tree/main"
     },
     {
       "id": "chorus-pedal",
@@ -385,7 +385,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-chorus/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-chorus/tree/main"
     }
   ],
   "variants": [
