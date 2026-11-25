@@ -75,6 +75,9 @@ when isMainModule:
         of "final":
           echo "chorus player: final credits ", payload{"scores"}
           break
+        of "error":
+          echo "chorus player: episode failed (", payload{"reason"}.getStr(), ")"
+          break
         else:
           discard
       except CatchableError as error:

@@ -41,6 +41,11 @@ type
     skArpeggio = "arpeggio"
     skPedal = "pedal"
 
+  FailureKind* = enum
+    fkNone = "none"
+    fkAction = "action_failure"
+    fkTransport = "transport_failure"
+
   Decision* = object
     target*: int
     steps*: seq[int]
@@ -52,6 +57,7 @@ type
     failed*: bool       ## true when an LLM seat failed to produce a legal
                         ## action (no credentials, transport error, or invalid
                         ## reply after retry). Never falls back to scripted.
+    failureKind*: FailureKind
     failureReason*: string
     rawReply*: string   ## last raw reply/body preserved on failure
 
@@ -483,26 +489,26 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a ChorusError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or a typed error describing why there is
+  ## none. Transport/auth/throttle/HTTP errors raise ChorusTransportError;
+  ## model refusals and truncated/malformed replies raise ChorusError.
   if error.len > 0:
-    raise newException(ChorusError, "llm transport: " & error)
+    raise newException(ChorusTransportError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(ChorusError,
+      raise newException(ChorusTransportError,
         "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(ChorusError,
+    raise newException(ChorusTransportError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
     discard client.tryNextBedrockModel("throttled")
-    raise newException(ChorusError, "llm throttled (429): " & detail)
+    raise newException(ChorusTransportError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(ChorusError, "anthropic error " & $response.code &
+    raise newException(ChorusTransportError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
@@ -592,6 +598,7 @@ proc decideAll*(
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var reasons = newSeq[string](seats.len)
+  var failureKinds = newSeq[FailureKind](seats.len)
   var lastRawReplies = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
@@ -600,7 +607,11 @@ proc decideAll*(
     elif client.disabled:
       let reason = "LLM credentials unavailable for non-scripted seat " & $seat
       echo "chorus llm: ", reason
-      result[index] = Decision(failed: true, failureReason: reason)
+      result[index] = Decision(
+        failed: true,
+        failureKind: fkTransport,
+        failureReason: reason
+      )
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -651,8 +662,16 @@ proc decideAll*(
             "say": (if sim.config.talk: decision.say else: ""), "notes": decision.notes}
           evidence.accepted = true
         result[index] = decision
+      except ChorusTransportError as error:
+        if capture: evidence.rejectionReason = some(error.msg)
+        failureKinds[index] = fkTransport
+        reasons[index] = cleanText(error.msg, MaxErrorLen)
+        echo "chorus llm: seat ", seat, " attempt ", attempt, " transport failed: ",
+          reasons[index]
+        stillOpen.add(index)
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        failureKinds[index] = fkAction
         reasons[index] = cleanText(error.msg, MaxErrorLen)
         echo "chorus llm: seat ", seat, " attempt ", attempt, " failed: ",
           reasons[index]
@@ -664,9 +683,13 @@ proc decideAll*(
     let reason =
       if reasons[index].len > 0: reasons[index]
       else: "LLM client disabled before decision completed"
-    echo "chorus llm: seat ", seat, " failed without fallback: ", reason
+    let kind =
+      if failureKinds[index] != fkNone: failureKinds[index]
+      else: fkTransport
+    echo "chorus llm: seat ", seat, " failed without fallback (", $kind, "): ", reason
     result[index] = Decision(
       failed: true,
+      failureKind: kind,
       failureReason: reason,
       rawReply: lastRawReplies[index]
     )

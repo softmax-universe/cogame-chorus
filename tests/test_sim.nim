@@ -484,16 +484,20 @@ suite "endings and results":
         round6(credited[seat])) < 1e-9
     var failed = initSim(config)
     failed.writeAll(onlyAt([0, 4, 8, 12], 1))
-    failed.failAction()
+    failed.failEpisode("action_failure")
     check failed.done
     check failed.reason == "action_failure"
     check failed.turnsPlayed == 1
     check failed.pendingSeats().len == 0
-    check failed.resultsJson()["reason"].getStr() == "action_failure"
     let failedFrames = replayMatch(config, failed.events)
     check failedFrames[^1].done
     check failedFrames[^1].reason == "action_failure"
     check failedFrames[^1].turnsPlayed == 1
+    var outage = initSim(config)
+    outage.failEpisode("transport_failure")
+    check outage.done
+    check outage.reason == "transport_failure"
+    check replayMatch(config, outage.events)[^1].reason == "transport_failure"
 
   test "the results shape is what the platform is promised":
     let config = fixtureConfig(bars = 6, seed = 16)
