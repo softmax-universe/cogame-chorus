@@ -115,7 +115,7 @@ usage or sampling evidence stays absent. Private evidence seals before public
 results and replay. Receipt admission and independent scenario review remain
 required; software fixtures do not provide model demonstrations.
 
-After building the native game and player, run the full capture system check:
+After building the native game and player, run the capture system check with the Python environment that provides the Coworld runner. It validates emitted failure files with the runner’s own `GamePlayerFailure` model.
 
 ```bash
 python3 tools/test_native_capture.py /absolute/path/to/chorus /absolute/path/to/chorus-player /new/private/output

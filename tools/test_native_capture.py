@@ -14,6 +14,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from coworld.runner.io import GamePlayerFailure
+
+
+def failure_mode_for_slot(mode, slot):
+    if mode == "mixed":
+        return "action" if slot == 2 else "transport"
+    return mode
+
 
 class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -34,7 +42,8 @@ class Provider(BaseHTTPRequestHandler):
             if str(other) != slot:
                 assert "PRIVATE_OPERATOR_" + str(other) not in user
         retry = "Your previous reply was invalid" in user
-        if self.fail_turn is not None and turn == self.fail_turn and self.fail_mode == "transport":
+        fail_mode = failure_mode_for_slot(self.fail_mode, int(slot))
+        if turn == self.fail_turn and fail_mode == "transport":
             response = b'{"error":"upstream transport outage"}'
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
@@ -43,7 +52,7 @@ class Provider(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response)
             return
-        if self.fail_turn is not None and turn == self.fail_turn and self.fail_mode == "action":
+        if turn == self.fail_turn and fail_mode == "action":
             text = "invalid fixture reply"
         elif turn == 0 and not retry:
             text = "invalid fixture reply"
@@ -57,6 +66,8 @@ class Provider(BaseHTTPRequestHandler):
                     "notes": "x" * 900,
                 }
             )
+        elif turn == 3:
+            text = json.dumps({"target": turn, "steps": [0] + [-1] * 15})
         else:
             payload = json.dumps(
                 {
@@ -172,34 +183,41 @@ def run(game, player, output, variant, capture, fail_turn=None, fail_mode=None):
             assert replay["results"] is None, "failed replay must remain unscored"
             assert replay["events"][-1]["kind"] == "end"
             assert replay["events"][-1]["text"] == expected_reason
-            failure = json.loads((root / "player_failure.json").read_text())
-            assert failure["reason"] == expected_reason
-            assert failure["turn"] == fail_turn
-            assert len(failure["failures"]) == seats
-            for entry in failure["failures"]:
-                assert entry["kind"] == expected_reason
-                if fail_mode == "transport":
-                    assert "upstream transport outage" in entry["raw_reply"]
-                else:
-                    assert entry["raw_reply"] == "invalid fixture reply"
+            failure = GamePlayerFailure.model_validate_json((root / "player_failure.json").read_bytes())
+            slot = 2 if fail_mode == "mixed" else 0
+            assert failure.failed_policy_index == slot
+            assert failure.kind == ("episode_inconclusive" if fail_mode == "transport" else "player_error")
+            assert failure.message == f"Chorus {expected_reason} at turn {fail_turn}, seat {slot}"
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert trace.stat().st_mode & 0o077 == 0
                 assert rows[-1]["status"] == "failed"
-                assert rows[-1]["outcome"] == failure
+                outcome = rows[-1]["outcome"]
+                assert outcome["reason"] == expected_reason and outcome["turn"] == fail_turn
+                assert [entry["seat"] for entry in outcome["failures"]] == list(range(seats))
+                for entry in outcome["failures"]:
+                    if failure_mode_for_slot(fail_mode, entry["seat"]) == "transport":
+                        assert entry["kind"] == "transport_failure"
+                        assert "upstream transport outage" in entry["raw_reply"]
+                    else:
+                        assert entry["kind"] == "action_failure"
+                        assert entry["raw_reply"] == "invalid fixture reply"
                 assert rows[-1]["participant_outcomes"] == {}
                 failed_rows = [r for r in rows[:-1] if r["decision_index"] // seats == fail_turn]
                 assert len(failed_rows) == seats
                 for row in failed_rows:
+                    transport = failure_mode_for_slot(fail_mode, int(row["seat"])) == "transport"
                     assert row["action_status"] == "rejected"
                     assert row["selected_attempt_id"] is None
                     assert row["executed_action"] is None
                     assert row["fallback_origin"] is None
                     assert len(row["attempts"]) == 2
+                    retry_prompt = row["attempts"][1]["request"]["messages"][0]["content"]
+                    assert ("Your previous reply was invalid" in retry_prompt) == (not transport)
                     for attempt in row["attempts"]:
                         assert not attempt["accepted"]
-                        if fail_mode == "transport":
+                        if transport:
                             assert "upstream transport outage" in attempt["raw_response"]
                         else:
                             assert attempt["response"] == "invalid fixture reply"
@@ -259,7 +277,7 @@ def main():
         captured = run(game, player, destination, variant, True)
         ordinary = run(game, player, destination, variant, False)
         assert captured == ordinary, "capture changed the native outcome or replay"
-    for mode in ("action", "transport"):
+    for mode in ("action", "transport", "mixed"):
         failed_captured = run(game, player, destination, manifest["variants"][0], True, fail_turn=1, fail_mode=mode)
         failed_ordinary = run(game, player, destination, manifest["variants"][0], False, fail_turn=1, fail_mode=mode)
         assert failed_captured == failed_ordinary, f"capture changed failed ({mode}) outcome or replay"
