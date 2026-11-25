@@ -95,7 +95,7 @@ Non-scripted seats never implicitly fall back to a scripted baseline: if an LLM 
 - `bars` turns (default 8, range 4–16); every bar is 16 steps.
 - `target` is a required integer satisfying `0 ≤ target ≤ turn`.
 - `steps` is a required JSON array of exactly 16 integers, each `-1` or `0..13`. Model replies must be a single JSON object (optionally wrapped in a standard outer Markdown JSON fence).
-- `say` is an optional single-line string (max 100 runes) all three other cogs read next turn (talk variants only); `notes` is an optional private notebook (max 600 runes) fed back verbatim.
+- `say` is an optional single-line string (first 100 runes shared) all three other cogs read next turn (talk variants only); `notes` is an optional private notebook (first 600 runes retained).
 - Endings: `complete` (all bars written), `deadline` (the play deadline was crossed between turns), or `action_failure` (a non-scripted seat failed to produce a legal action after retry).
 
 Full rules and the metric with worked examples are in the manifest's `rules.md` and `scoring.md`
@@ -115,7 +115,7 @@ usage or sampling evidence stays absent. Private evidence seals before public
 results and replay. Receipt admission and independent scenario review remain
 required; software fixtures do not provide model demonstrations.
 
-After building the native game and player, run the full capture system check:
+After building the native game and player, run the capture system check with the Python environment that provides the Coworld runner. It validates emitted failure files with the runner’s own `GamePlayerFailure` model.
 
 ```bash
 python3 tools/test_native_capture.py /absolute/path/to/chorus /absolute/path/to/chorus-player /new/private/output

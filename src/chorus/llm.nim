@@ -401,15 +401,15 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add(operatorBlock(prompt))
   result.add("LEGAL TARGETS THIS TURN: " & sim.legalTargetList() &
     "  (bar " & $sim.turn & " is the new bar).\n\n")
-  result.add("Reply with ONLY {\"target\": " & $sim.turn &
-    ", \"steps\": [0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]" &
-    (if sim.config.talk: ", \"say\": \"…\"" else: "") &
-    ", \"notes\": \"…\"} — steps is exactly " & $Steps &
-    " values, each -1 (rest) or a whole number 0.." & $MaxToken &
-    "; target is one of the legal targets above" &
-    (if sim.config.talk: "; say at most " & $MaxSayLen & " characters (or \"\")"
-     else: "") &
-    "; notes at most " & $MaxNotesLen & " characters.")
+  result.add("Reply with one JSON object. Example for the new bar: {\"target\": " &
+    $sim.turn & ", \"steps\": [0,-1,-1,4, -1,-1,2,-1, 0,-1,-1,4, -1,-1,-1,-1]}. " &
+    "Choose a legal target and write exactly " & $Steps &
+    " integers in one flat array (four groups of four). Use -1 for a rest or 0.." &
+    $MaxToken & " for a note. Only target and steps are required. " &
+    (if sim.config.talk: "Optional say: one line up to " & $MaxSayLen &
+      " characters. " else: "") &
+    "Omit notes to keep your private notes, or replace them with a string up to " &
+    $MaxNotesLen & " characters.")
 
 proc retryHint*(sim: Sim, reason: string): string =
   "\nYour previous reply was invalid: " & reason &
@@ -552,7 +552,7 @@ proc parseSteps*(node: JsonNode): seq[int] =
 proc parseDecision*(payload: JsonNode, turn: int): Decision =
   ## Parses a canonical Chorus action: required integer `target` in 0..turn,
   ## required 16-integer `steps` array, and optional string `say` / `notes`
-  ## within their published rune limits.
+  ## stored by the simulation within its published rune limits.
   if payload.isNil or payload.kind != JObject:
     raise newException(ChorusError, "decision must be a JSON object")
   if not payload.hasKey("target") or payload["target"].kind != JInt:
@@ -569,18 +569,11 @@ proc parseDecision*(payload: JsonNode, turn: int): Decision =
     let say = payload["say"].getStr()
     if '\n' in say or '\r' in say:
       raise newException(ChorusError, "say must be a single line")
-    if say.runeLen > MaxSayLen:
-      raise newException(ChorusError,
-        "say must be at most " & $MaxSayLen & " characters")
     result.say = say
   if payload.hasKey("notes"):
     if payload["notes"].kind != JString:
       raise newException(ChorusError, "notes must be a string")
-    let notes = payload["notes"].getStr()
-    if notes.runeLen > MaxNotesLen:
-      raise newException(ChorusError,
-        "notes must be at most " & $MaxNotesLen & " characters")
-    result.notes = notes
+    result.notes = payload["notes"].getStr()
 
 proc decideAll*(
   client: LlmClient,
@@ -622,7 +615,7 @@ proc decideAll*(
     for index in open:
       let seat = seats[index]
       var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
+      if attempt > 0 and failureKinds[index] == fkAction:
         user.add(sim.retryHint(reasons[index]))
       let request = client.requestFor(systemPrompt(sim, seat), user, seat)
       if capture:
@@ -666,15 +659,13 @@ proc decideAll*(
         if capture: evidence.rejectionReason = some(error.msg)
         failureKinds[index] = fkTransport
         reasons[index] = cleanText(error.msg, MaxErrorLen)
-        echo "chorus llm: seat ", seat, " attempt ", attempt, " transport failed: ",
-          reasons[index]
+        echo "chorus llm: seat ", seat, " attempt ", attempt, " transport failed"
         stillOpen.add(index)
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
         failureKinds[index] = fkAction
         reasons[index] = cleanText(error.msg, MaxErrorLen)
-        echo "chorus llm: seat ", seat, " attempt ", attempt, " failed: ",
-          reasons[index]
+        echo "chorus llm: seat ", seat, " attempt ", attempt, " action rejected"
         stillOpen.add(index)
       if capture: client.nativeAttempts[seat].add(evidence)
     open = stillOpen
@@ -686,7 +677,7 @@ proc decideAll*(
     let kind =
       if failureKinds[index] != fkNone: failureKinds[index]
       else: fkTransport
-    echo "chorus llm: seat ", seat, " failed without fallback (", $kind, "): ", reason
+    echo "chorus llm: seat ", seat, " failed without fallback (", $kind, ")"
     result[index] = Decision(
       failed: true,
       failureKind: kind,

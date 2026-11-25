@@ -190,6 +190,21 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.tableStateJson())
 
+proc playerFailure(report: JsonNode): JsonNode =
+  # Coworld accepts one slot. Match the episode reason even if another seat
+  # suffered a transport outage on the same turn.
+  let reason = report["reason"].getStr()
+  for entry in report["failures"]:
+    if entry["kind"].getStr() == reason:
+      let seat = entry["seat"].getInt()
+      let turn = report["turn"].getInt()
+      return %*{
+        "message": "Chorus " & reason & " at turn " & $turn & ", seat " & $seat,
+        "failed_policy_index": seat,
+        "kind": (if reason == $fkTransport: "episode_inconclusive" else: "player_error")
+      }
+  raise newException(AssertionDefect, "episode failure must identify an affected seat")
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var failed = false
   var results: JsonNode
@@ -203,7 +218,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     failed = not state.failureReport.isNil
     if failed:
       failureReason = state.failureReport{"reason"}.getStr("action_failure")
-      failureData = $state.failureReport
+      failureData = $playerFailure(state.failureReport)
       replayData = state.replayPayload(newJNull())
       # Seal failed private evidence without settling ordinary scores.
       state.trajectory.finishFailedNativeTrajectory(state.failureReport)
@@ -403,7 +418,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if allTransport: $fkTransport else: $fkAction
           echo "chorus: turn ", decisionTurn,
             " aborted unscored due to ", failureReason,
-            " (no scripted fallback): ", $failedSeats
+            " (", failedSeats.len, " affected seats)"
           if not state.trajectory.isNil:
             for index, seat in seats:
               if decisions[index].failed:
