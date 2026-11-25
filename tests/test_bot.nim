@@ -242,3 +242,28 @@ suite "scripted baselines":
     for alias in ["1", "true", "yes", "drone", "unknown"]:
       expect ChorusError:
         discard parseScriptKind(alias)
+
+  test "decideAll refuses unregistered seats without issuing model requests":
+    for key in ["COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
+      delEnv(key)
+    putEnv("COWORLD_LLM_ENDPOINT", "http://127.0.0.1:9")
+    putEnv("COWORLD_LLM_MODEL", "fixture/unregistered-check")
+    let config = fixture(11, bars = 4)
+    let client = newLlmClient(config)
+    delEnv("COWORLD_LLM_ENDPOINT")
+    delEnv("COWORLD_LLM_MODEL")
+    check not client.disabled
+    var sim = initSim(config)
+    let seats = sim.pendingSeats()
+    let decisions = client.decideAll(sim, seats, @["", "", "", ""],
+      @[skArpeggio, skNone, skPedal, skPedal],
+      registered = @[true, false, true, true])
+    check decisions.len == Seats
+    check not decisions[0].failed and decisions[0].scripted
+    check decisions[1].failed
+    check decisions[1].failureKind == fkRegistration
+    check not decisions[1].scripted
+    check not decisions[2].failed and decisions[2].scripted
+    check not decisions[3].failed and decisions[3].scripted

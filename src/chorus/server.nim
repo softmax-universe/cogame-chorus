@@ -48,6 +48,7 @@ type
     sim: Sim
     prompts: seq[string]
     scripted: seq[ScriptKind]
+    registered: seq[bool]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -298,6 +299,15 @@ const PlayBudgetFraction* = 0.6
   ## container start, player connects, and writing the artifacts — the part
   ## that must never be the thing that runs out of time.
 
+proc registeredCountLocked(gs: GameState): int =
+  for ok in gs.registered:
+    if ok:
+      inc result
+
+proc allRegisteredLocked(gs: GameState): bool =
+  gs.registered.len == gs.config.tokens.len and
+    gs.registeredCountLocked() == gs.config.tokens.len
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -305,18 +315,45 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let deadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < deadline:
-      var allConnected = false
+      var allRegistered = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        allRegistered = state.allRegisteredLocked()
+      if allRegistered:
         break
-      sleep(200)
+      sleep(50)
 
+    var registrationFailed = false
     withLock stateLock:
-      state.started = true
-      echo "chorus: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+      if not state.allRegisteredLocked():
+        registrationFailed = true
+        var failedSeats = newJArray()
+        for slot in 0 ..< config.tokens.len:
+          if not state.registered[slot]:
+            failedSeats.add(%*{
+              "seat": slot,
+              "policy": config.players[slot].name,
+              "kind": $fkRegistration,
+              "reason": "seat did not complete role registration before timeout",
+              "raw_reply": ""
+            })
+        echo "chorus: startup aborted unscored; ", failedSeats.len,
+          " seat(s) did not complete role registration before timeout"
+        state.failureReport = %*{
+          "reason": $fkRegistration,
+          "turn": 0,
+          "failures": failedSeats
+        }
+        state.sim.failEpisode($fkRegistration)
+        state.broadcastLocked()
+      else:
+        state.started = true
+        echo "chorus: starting with ", state.registeredCountLocked(), "/",
+          config.tokens.len, " players registered"
+        state.broadcastLocked()
+
+    if registrationFailed:
+      finishEpisode(runtimeConfig)
+      return
 
     let client = newLlmClient(config)
 
@@ -348,6 +385,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var seats: seq[int]
       var prompts: seq[string]
       var scripted: seq[ScriptKind]
+      var registered: seq[bool]
       var privateViews: seq[JsonNode]
       withLock stateLock:
         if state.sim.done:
@@ -365,6 +403,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         simCopy = state.sim
         prompts = state.prompts
         scripted = state.scripted
+        registered = state.registered
         if not state.trajectory.isNil:
           for seat in seats:
             privateViews.add(state.playerStateJson(seat))
@@ -378,7 +417,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var needsLlm = false
       if not client.disabled:
         for seat in seats:
-          if scripted[seat] == skNone:
+          if registered[seat] and scripted[seat] == skNone:
             needsLlm = true
       if needsLlm and config.minTurnSpacingMs > 0 and lastBatchStart > 0.0:
         var waitMs = config.minTurnSpacingMs -
@@ -394,16 +433,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## The slow part (Claude, one parallel batch for the turn) runs
       ## outside the lock on a snapshot; only this thread mutates the sim,
       ## so the snapshot cannot go stale.
-      let decisions = client.decideAll(simCopy, seats, prompts, scripted)
+      let decisions = client.decideAll(simCopy, seats, prompts, scripted,
+        registered)
 
       var turnFailed = false
       withLock stateLock:
         var failedSeats = newJArray()
-        var allTransport = true
+        var failureReason = $fkTransport
         for index, seat in seats:
           if decisions[index].failed:
-            if decisions[index].failureKind != fkTransport:
-              allTransport = false
+            if decisions[index].failureKind == fkRegistration:
+              failureReason = $fkRegistration
+            elif decisions[index].failureKind != fkTransport and
+                failureReason != $fkRegistration:
+              failureReason = $fkAction
             failedSeats.add(%*{
               "seat": seat,
               "policy": config.players[seat].name,
@@ -414,8 +457,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if failedSeats.len > 0:
           turnFailed = true
           let decisionTurn = simCopy.turn
-          let failureReason =
-            if allTransport: $fkTransport else: $fkAction
           echo "chorus: turn ", decisionTurn,
             " aborted unscored due to ", failureReason,
             " (", failedSeats.len, " affected seats)"
@@ -559,6 +600,8 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
     withLock stateLock:
       state.playerSockets[slot] = websocket
       state.socketSlots[websocket] = slot
+      if not state.started:
+        state.registered[slot] = false
       echo "chorus: player slot ", slot, " connected (",
         state.playerSockets.len, "/", state.config.tokens.len, ")"
       let voice = state.sim.voiceOf[slot]
@@ -628,9 +671,10 @@ proc websocketHandler(
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
-          echo "chorus: slot ", slot, " delivered a prompt (",
+            state.registered[slot] = true
+          echo "chorus: slot ", slot, " registered prompt (",
             prompt.len, " chars",
-            (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
+            (if scripted != skNone: ", scripted " & $scripted else: ", model"), ")"
       except CatchableError as error:
         echo "chorus: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -705,6 +749,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.trajectory = initNativeTrajectory(config)
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)
