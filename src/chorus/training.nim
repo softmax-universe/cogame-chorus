@@ -114,3 +114,9 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
     else: esFailed
   trajectory.finish(status, outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishFailedNativeTrajectory*(trajectory: DecisionTrajectory,
+    failureReport: JsonNode) =
+  if trajectory.isNil: return
+  trajectory.finish(esFailed, failureReport, newJObject())
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

@@ -191,44 +191,76 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
     result.add(frame.tableStateJson())
 
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
+  var failed = false
   var results: JsonNode
   var replayData: string
   var failureData: string
+  var failureReason = ""
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
-    results = state.sim.resultsJson()
-    replayData = state.replayPayload(results)
-    if not state.failureReport.isNil:
+    failed = not state.failureReport.isNil
+    if failed:
+      failureReason = state.failureReport{"reason"}.getStr("action_failure")
       failureData = $state.failureReport
-    # Seal private evidence before the result artifact can stop the game pod.
-    state.trajectory.finishNativeTrajectory(state.sim)
+      replayData = state.replayPayload(newJNull())
+      # Seal failed private evidence without settling ordinary scores.
+      state.trajectory.finishFailedNativeTrajectory(state.failureReport)
+      var errorFrame = %*{
+        "type": "error",
+        "done": true,
+        "reason": failureReason
+      }
+      for slot, socket in state.playerSockets:
+        errorFrame["slot"] = %slot
+        socket.send($errorFrame)
+      state.broadcastLocked()
+    else:
+      results = state.sim.resultsJson()
+      replayData = state.replayPayload(results)
+      # Seal private evidence before the result artifact can stop the game pod.
+      state.trajectory.finishNativeTrajectory(state.sim)
 
-    ## Send final frames to players BEFORE writing artifacts: the hosted
-    ## worker tears player pods down as soon as results.json exists, and
-    ## writing first would race player log collection.
-    ## Results carry POLICY names for the platform, but the final frame goes
-    ## to the player sockets — hand them the table aliases instead.
-    var aliasNames = newJArray()
-    for name in state.sim.names:
-      aliasNames.add(%name)
-    var final = %*{
-      "type": "final",
-      "done": true,
-      "scores": results["scores"],
-      "voices": results["voices"],
-      "names": aliasNames,
-      "piece": results["piece"],
-      "bars": results["bars"],
-      "reason": results["reason"]
-    }
-    for slot, socket in state.playerSockets:
-      final["slot"] = %slot
-      socket.send($final)
-    state.broadcastLocked()
+      ## Send final frames to players BEFORE writing artifacts: the hosted
+      ## worker tears player pods down as soon as results.json exists, and
+      ## writing first would race player log collection.
+      ## Results carry POLICY names for the platform, but the final frame goes
+      ## to the player sockets — hand them the table aliases instead.
+      var aliasNames = newJArray()
+      for name in state.sim.names:
+        aliasNames.add(%name)
+      var final = %*{
+        "type": "final",
+        "done": true,
+        "scores": results["scores"],
+        "voices": results["voices"],
+        "names": aliasNames,
+        "piece": results["piece"],
+        "bars": results["bars"],
+        "reason": results["reason"]
+      }
+      for slot, socket in state.playerSockets:
+        final["slot"] = %slot
+        socket.send($final)
+      state.broadcastLocked()
 
   sleep(500)
+  if failed:
+    echo "chorus: episode failed unscored (", failureReason,
+      "); writing failure evidence and unscored replay (no results.json)"
+    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+    if failureUri.len > 0:
+      writeArtifact(
+        failureUri, failureData, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
+    writeArtifact(
+      runtimeConfig.replayUri, replayData, "application/octet-stream",
+      "COGAME_SAVE_REPLAY_METHOD"
+    )
+    quit(1)
+
   echo "chorus: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -238,14 +270,6 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     runtimeConfig.replayUri, replayData, "application/octet-stream",
     "COGAME_SAVE_REPLAY_METHOD"
   )
-  if failureData.len > 0:
-    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-    if failureUri.len > 0:
-      echo "chorus: writing player failure report"
-      writeArtifact(
-        failureUri, failureData, "application/json",
-        "COGAME_PLAYER_FAILURE_METHOD"
-      )
   ## Bounded shutdown grace: /healthz and /global keep answering while the
   ## runner finishes its post-start probes, then the process exits.
   echo "chorus: artifacts written; holding the server up for ",
@@ -360,20 +384,26 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var turnFailed = false
       withLock stateLock:
         var failedSeats = newJArray()
+        var allTransport = true
         for index, seat in seats:
           if decisions[index].failed:
+            if decisions[index].failureKind != fkTransport:
+              allTransport = false
             failedSeats.add(%*{
               "seat": seat,
               "policy": config.players[seat].name,
+              "kind": $decisions[index].failureKind,
               "reason": decisions[index].failureReason,
               "raw_reply": decisions[index].rawReply
             })
         if failedSeats.len > 0:
           turnFailed = true
           let decisionTurn = simCopy.turn
+          let failureReason =
+            if allTransport: $fkTransport else: $fkAction
           echo "chorus: turn ", decisionTurn,
-            " aborted due to action failure (no scripted fallback): ",
-            $failedSeats
+            " aborted unscored due to ", failureReason,
+            " (no scripted fallback): ", $failedSeats
           if not state.trajectory.isNil:
             for index, seat in seats:
               if decisions[index].failed:
@@ -385,11 +415,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                   privateViews[index], client.nativeAttempts[seat],
                   status = asMissing, terminal = true)
           state.failureReport = %*{
-            "reason": "action_failure",
+            "reason": failureReason,
             "turn": decisionTurn,
             "failures": failedSeats
           }
-          state.sim.failAction()
+          state.sim.failEpisode(failureReason)
           state.broadcastLocked()
         else:
           for index, seat in seats:
@@ -408,22 +438,23 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             except ChorusError as error:
               turnFailed = true
               echo "chorus: reply rejected (", error.msg,
-                "); ending episode with action_failure"
+                "); ending episode unscored with action_failure"
               if not state.trajectory.isNil:
                 state.trajectory.recordFailedDecision(config, decisionTurn, seat,
                   privateViews[index], client.nativeAttempts[seat],
                   status = asRejected, terminal = true)
               state.failureReport = %*{
-                "reason": "action_failure",
+                "reason": $fkAction,
                 "turn": decisionTurn,
                 "failures": [{
                   "seat": seat,
                   "policy": config.players[seat].name,
+                  "kind": $fkAction,
                   "reason": error.msg,
                   "raw_reply": decision.rawReply
                 }]
               }
-              state.sim.failAction()
+              state.sim.failEpisode($fkAction)
               break
             if not state.trajectory.isNil:
               let action = %*{"target": decision.target, "steps": decision.steps,

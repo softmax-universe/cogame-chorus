@@ -2,6 +2,7 @@ import std/[json, strutils]
 
 type
   ChorusError* = object of CatchableError
+  ChorusTransportError* = object of ChorusError
 
   PlayerConfig* = object
     name*: string

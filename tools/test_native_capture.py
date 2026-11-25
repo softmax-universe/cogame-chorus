@@ -18,6 +18,7 @@ from pathlib import Path
 class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     fail_turn = None
+    fail_mode = None
 
     def log_message(self, *args):
         pass
@@ -33,7 +34,16 @@ class Provider(BaseHTTPRequestHandler):
             if str(other) != slot:
                 assert "PRIVATE_OPERATOR_" + str(other) not in user
         retry = "Your previous reply was invalid" in user
-        if self.fail_turn is not None and turn == self.fail_turn:
+        if self.fail_turn is not None and turn == self.fail_turn and self.fail_mode == "transport":
+            response = b'{"error":"upstream transport outage"}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
+            self.end_headers()
+            self.wfile.write(response)
+            return
+        if self.fail_turn is not None and turn == self.fail_turn and self.fail_mode == "action":
             text = "invalid fixture reply"
         elif turn == 0 and not retry:
             text = "invalid fixture reply"
@@ -74,8 +84,8 @@ class Provider(BaseHTTPRequestHandler):
         self.wfile.write(response)
 
 
-def run(game, player, output, variant, capture, fail_turn=None):
-    suffix = f"fail{fail_turn}" if fail_turn is not None else "ok"
+def run(game, player, output, variant, capture, fail_turn=None, fail_mode=None):
+    suffix = f"fail-{fail_mode}-{fail_turn}" if fail_turn is not None else "ok"
     root = output / f"{variant['id']}-capture{capture}-{suffix}"
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
@@ -122,6 +132,7 @@ def run(game, player, output, variant, capture, fail_turn=None):
         pass
 
     ScopedProvider.fail_turn = fail_turn
+    ScopedProvider.fail_mode = fail_mode
     provider = ThreadingHTTPServer(("127.0.0.1", 0), ScopedProvider)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
@@ -150,26 +161,34 @@ def run(game, player, output, variant, capture, fail_turn=None):
             player_env = dict(env, PLAYER_PROMPT=f"PRIVATE_OPERATOR_{seat}", COWORLD_TIMEOUT_SECONDS="120")
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
-        assert server.wait(timeout=120) == 0
+        exit_code = server.wait(timeout=120)
         for child in children[1:]:
             assert child.wait(timeout=5) == 0
-        results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
         if fail_turn is not None:
-            assert results["reason"] == "action_failure"
-            assert results["bars"] == fail_turn
+            expected_reason = "transport_failure" if fail_mode == "transport" else "action_failure"
+            assert exit_code != 0, "failed episode must exit non-zero"
+            assert not (root / "results.json").exists(), "failed episode must never write results.json"
+            assert replay["results"] is None, "failed replay must remain unscored"
+            assert replay["events"][-1]["kind"] == "end"
+            assert replay["events"][-1]["text"] == expected_reason
             failure = json.loads((root / "player_failure.json").read_text())
-            assert failure["reason"] == "action_failure"
+            assert failure["reason"] == expected_reason
             assert failure["turn"] == fail_turn
             assert len(failure["failures"]) == seats
             for entry in failure["failures"]:
-                assert entry["raw_reply"] == "invalid fixture reply"
+                assert entry["kind"] == expected_reason
+                if fail_mode == "transport":
+                    assert "upstream transport outage" in entry["raw_reply"]
+                else:
+                    assert entry["raw_reply"] == "invalid fixture reply"
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert trace.stat().st_mode & 0o077 == 0
                 assert rows[-1]["status"] == "failed"
-                assert rows[-1]["outcome"] == results
+                assert rows[-1]["outcome"] == failure
+                assert rows[-1]["participant_outcomes"] == {}
                 failed_rows = [r for r in rows[:-1] if r["decision_index"] // seats == fail_turn]
                 assert len(failed_rows) == seats
                 for row in failed_rows:
@@ -180,8 +199,14 @@ def run(game, player, output, variant, capture, fail_turn=None):
                     assert len(row["attempts"]) == 2
                     for attempt in row["attempts"]:
                         assert not attempt["accepted"]
-                        assert attempt["response"] == "invalid fixture reply"
+                        if fail_mode == "transport":
+                            assert "upstream transport outage" in attempt["raw_response"]
+                        else:
+                            assert attempt["response"] == "invalid fixture reply"
+            return failure, replay
         else:
+            assert exit_code == 0
+            results = json.loads((root / "results.json").read_text())
             assert results["reason"] == "complete"
             assert results["bars"] == config["bars"]
             assert not (root / "player_failure.json").exists()
@@ -209,7 +234,7 @@ def run(game, player, output, variant, capture, fail_turn=None):
                         assert attempt["prompt"][0]["content"] == attempt["request"]["system"]
                         assert attempt["platform_call_id"] is not None
                         assert attempt["behavior_logprobs"] is None
-        return results, replay
+            return results, replay
     finally:
         provider.shutdown()
         provider.server_close()
@@ -234,12 +259,13 @@ def main():
         captured = run(game, player, destination, variant, True)
         ordinary = run(game, player, destination, variant, False)
         assert captured == ordinary, "capture changed the native outcome or replay"
-    failed_captured = run(game, player, destination, manifest["variants"][0], True, fail_turn=1)
-    failed_ordinary = run(game, player, destination, manifest["variants"][0], False, fail_turn=1)
-    assert failed_captured == failed_ordinary, "capture changed failed episode outcome or replay"
+    for mode in ("action", "transport"):
+        failed_captured = run(game, player, destination, manifest["variants"][0], True, fail_turn=1, fail_mode=mode)
+        failed_ordinary = run(game, player, destination, manifest["variants"][0], False, fail_turn=1, fail_mode=mode)
+        assert failed_captured == failed_ordinary, f"capture changed failed ({mode}) outcome or replay"
     print(
         "native games: capture parity, exact requests, retries, outer fence, "
-        "explicit action_failure without fallback, privacy and missing usage pass"
+        "unscored action_failure and transport_failure without results.json, privacy and missing usage pass"
     )
 
 

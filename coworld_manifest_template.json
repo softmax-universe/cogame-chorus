@@ -280,7 +280,7 @@
           "minimum": 4
         },
         "reason": {
-          "description": "How the episode ended: complete (all bars written), deadline (episode clock; the piece is scored on the bars actually written), or action_failure (a non-scripted seat failed to produce a legal action after retry).",
+          "description": "How a scored episode ended: complete (all bars written) or deadline (episode clock; the piece is scored on the bars actually written). Unscored failures (action_failure, transport_failure) do not write results.json.",
           "type": "string"
         }
       }

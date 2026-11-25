@@ -87,7 +87,7 @@ Two scripted baselines ship in the same image and are selected with `PLAYER_SCRI
 | `arpeggio` | chord tones spread across the four voices on complementary steps, rotated a place each bar. The strong scripted baseline. |
 | `pedal` | the chord root on the downbeat and a fifth halfway through the odd bars. Always legal, far too thin to score. |
 
-Non-scripted seats never implicitly fall back to a scripted baseline: if an LLM seat has no credentials or fails both attempts, the episode ends with `action_failure` and preserves the raw reply. Certification seats explicitly select baseline policies (`chorus-arpeggio` and `chorus-pedal`).
+Non-scripted seats never implicitly fall back to a scripted baseline: if an LLM seat suffers a transport outage (`transport_failure`) or fails both attempts (`action_failure`), the episode ends unscored without writing `results.json` while preserving raw failure and replay evidence. Certification seats explicitly select baseline policies (`chorus-arpeggio` and `chorus-pedal`).
 
 ## The rules, in one screen
 

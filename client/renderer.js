@@ -910,7 +910,11 @@
             (ctx.playedBars || 0) + " of " + (ctx.bars || 0) + " bars.";
         }
         if (event.text === "action_failure") {
-          return "Action failure — episode ended after " +
+          return "Action failure — episode ended unscored after " +
+            (ctx.playedBars || 0) + " of " + (ctx.bars || 0) + " bars.";
+        }
+        if (event.text === "transport_failure") {
+          return "Transport failure — episode ended unscored after " +
             (ctx.playedBars || 0) + " of " + (ctx.bars || 0) + " bars.";
         }
         return "FINAL — piece " + one(ctx.piece) + " · credits " +
@@ -1000,6 +1004,7 @@
       var reason = state.reason || (results && results.reason);
       if (reason === "deadline") line += " · DEADLINE";
       if (reason === "action_failure") line += " · ACTION FAILURE";
+      if (reason === "transport_failure") line += " · TRANSPORT FAILURE";
       return line;
     }
     var parts = ["BAR " + (state.turn || 0) + " / " + (state.turns || 0)];
@@ -1047,7 +1052,12 @@
         " bars";
     }
     if (results.reason === "action_failure") {
-      return "action failure: episode ended after " +
+      return "action failure: episode ended unscored after " +
+        (results.bars || 0) + " of " + (results.maxBars || results.bars || 0) +
+        " bars";
+    }
+    if (results.reason === "transport_failure") {
+      return "transport failure: episode ended unscored after " +
         (results.bars || 0) + " of " + (results.maxBars || results.bars || 0) +
         " bars";
     }

@@ -108,9 +108,11 @@ suite "scripted baselines":
       @[skNone, skArpeggio, skPedal, skNone])
     check decisions.len == Seats
     check decisions[0].failed
+    check decisions[0].failureKind == fkTransport
     check not decisions[0].scripted
     check "unavailable" in decisions[0].failureReason
     check decisions[3].failed
+    check decisions[3].failureKind == fkTransport
     check not decisions[3].scripted
     ## Explicitly scripted seats still run their selected baseline.
     check not decisions[1].failed
@@ -141,6 +143,7 @@ suite "scripted baselines":
     check decisions.len == Seats
     for index, seat in seats:
       check decisions[index].failed
+      check decisions[index].failureKind == fkTransport
       check not decisions[index].scripted
       check decisions[index].failureReason.len > 0
       check decisions[index].rawReply.len > 0
