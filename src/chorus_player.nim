@@ -5,7 +5,7 @@
 ## actual decision making happens inside the game server, which sends this
 ## seat's prompt to Claude every turn.
 ##
-## PLAYER_SCRIPTED=arpeggio (or 1) registers the seat as the built-in
+## PLAYER_SCRIPTED=arpeggio registers the seat as the built-in
 ## arpeggio baseline instead; PLAYER_SCRIPTED=pedal as the thin pedal
 ## baseline. The server plays those deterministically, no LLM.
 ##

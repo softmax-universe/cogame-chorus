@@ -909,6 +909,10 @@
           return "Episode deadline — the piece was scored on " +
             (ctx.playedBars || 0) + " of " + (ctx.bars || 0) + " bars.";
         }
+        if (event.text === "action_failure") {
+          return "Action failure — episode ended after " +
+            (ctx.playedBars || 0) + " of " + (ctx.bars || 0) + " bars.";
+        }
         return "FINAL — piece " + one(ctx.piece) + " · credits " +
           (ctx.credits || []).map(function (v, i) {
             return name(i) + " " + signed(v);
@@ -995,6 +999,7 @@
       var line = "FINAL — PIECE " + one(state.piece);
       var reason = state.reason || (results && results.reason);
       if (reason === "deadline") line += " · DEADLINE";
+      if (reason === "action_failure") line += " · ACTION FAILURE";
       return line;
     }
     var parts = ["BAR " + (state.turn || 0) + " / " + (state.turns || 0)];
@@ -1038,6 +1043,11 @@
   function reasonLine(results) {
     if (results.reason === "deadline") {
       return "episode deadline: the piece was scored on " +
+        (results.bars || 0) + " of " + (results.maxBars || results.bars || 0) +
+        " bars";
+    }
+    if (results.reason === "action_failure") {
+      return "action failure: episode ended after " +
         (results.bars || 0) + " of " + (results.maxBars || results.bars || 0) +
         " bars";
     }

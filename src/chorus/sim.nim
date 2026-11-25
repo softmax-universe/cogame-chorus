@@ -91,7 +91,7 @@ type
     turnsPlayed*: int
     phase*: Phase
     done*: bool
-    reason*: string                  ## "complete" | "deadline"
+    reason*: string                  ## "complete" | "deadline" | "action_failure"
     events*: seq[GameEvent]
 
 # ---- Small helpers ----------------------------------------------------------
@@ -454,8 +454,7 @@ proc resolveTurn(sim: var Sim) =
 proc applyBar*(sim: var Sim, seat, target: int, steps: seq[int],
     say, notes: string, scripted: bool) =
   ## `seat` writes one bar in its own voice. Raises ChorusError on anything
-  ## illegal WITHOUT mutating; the game server falls back to the scripted
-  ## baseline on a rejection. The fourth bar resolves the turn.
+  ## illegal WITHOUT mutating. The fourth bar resolves the turn.
   if sim.done:
     raise newException(ChorusError, "the episode is over")
   if seat < 0 or seat >= Seats:
@@ -517,6 +516,13 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline")
+
+proc failAction*(sim: var Sim) =
+  ## End the episode explicitly when an LLM seat fails to produce a legal
+  ## action (no implicit scripted fallback).
+  if sim.done:
+    return
+  sim.settle("action_failure")
 
 # ---- Results ----------------------------------------------------------------
 

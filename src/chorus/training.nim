@@ -60,12 +60,8 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
   var attempts = evidence
   var selected = none(string)
   var status = asAccepted
-  var fallback = none(string)
-  if scripted and attempts.len > 0:
-    status = asFallback
-    fallback = some("engine-arpeggio")
-    for attempt in attempts.mitems: attempt.accepted = false
-  elif attempts.len > 0:
+  if attempts.len > 0:
+    doAssert not scripted, "model attempts must never be replaced by a scripted fallback"
     doAssert attempts[^1].parsedAction == action
     if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
     else: status = asRejected
@@ -85,13 +81,36 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
           attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
   trajectory.recordDecision($turn & "-" & $seat, $seat, view,
-    attempts, selected, action, status, fallbackOrigin = fallback)
+    attempts, selected, action, status)
+
+proc recordFailedDecision*(trajectory: DecisionTrajectory, config: GameConfig,
+    turn, seat: int, observation: JsonNode, evidence: seq[DecisionAttempt],
+    status: ActionStatus = asRejected, terminal = true) =
+  if trajectory.isNil: return
+  var attempts = evidence
+  if status == asRejected:
+    for attempt in attempts.mitems:
+      attempt.accepted = false
+  var view = copy(observation)
+  view["prompt_attempts"] = newJArray()
+  for attempt in attempts:
+    if attempt.origin == aoModel:
+      view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
+        "prompt_template": promptMetadata(config,
+          attempt.request["system"].getStr(),
+          attempt.request["messages"][0]["content"].getStr())})
+  trajectory.recordDecision($turn & "-" & $seat, $seat, view,
+    attempts, none(string), newJNull(), status, terminal = terminal)
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   if trajectory.isNil: return
   let outcome = game.resultsJson()
   var scores = newJObject()
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
-  trajectory.finish(if outcome["reason"].getStr() == "complete": esCompleted else: esTruncated,
-    outcome, scores)
+  let reason = outcome["reason"].getStr()
+  let status =
+    if reason == "complete": esCompleted
+    elif reason == "deadline": esTruncated
+    else: esFailed
+  trajectory.finish(status, outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
