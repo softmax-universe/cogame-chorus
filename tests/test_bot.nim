@@ -209,19 +209,17 @@ suite "scripted baselines":
         array16 & "}"), 3)
     expect ChorusError:
       discard parseDecision(parseJson("""{"target": 0}"""), 0)
-    ## Overlong say/notes and multiline say are rejected instead of silently truncated.
+    ## Private notes and speech limits are applied when stored, not when validating the music.
     var longSay = ""
     for index in 0 ..< MaxSayLen + 1:
       longSay.add("音")
     var longNotes = ""
     for index in 0 ..< MaxNotesLen + 1:
       longNotes.add("音")
-    expect ChorusError:
-      discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
-        ", \"say\": \"" & longSay & "\"}"), 0)
-    expect ChorusError:
-      discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
-        ", \"notes\": \"" & longNotes & "\"}"), 0)
+    let withLongText = parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
+      ", \"say\": \"" & longSay & "\", \"notes\": \"" & longNotes & "\"}"), 0)
+    check withLongText.say == longSay
+    check withLongText.notes == longNotes
     expect ChorusError:
       discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
         ", \"say\": \"line1\\nline2\"}"), 0)

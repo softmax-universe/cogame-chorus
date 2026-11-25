@@ -552,7 +552,7 @@ proc parseSteps*(node: JsonNode): seq[int] =
 proc parseDecision*(payload: JsonNode, turn: int): Decision =
   ## Parses a canonical Chorus action: required integer `target` in 0..turn,
   ## required 16-integer `steps` array, and optional string `say` / `notes`
-  ## within their published rune limits.
+  ## stored by the simulation within its published rune limits.
   if payload.isNil or payload.kind != JObject:
     raise newException(ChorusError, "decision must be a JSON object")
   if not payload.hasKey("target") or payload["target"].kind != JInt:
@@ -569,18 +569,11 @@ proc parseDecision*(payload: JsonNode, turn: int): Decision =
     let say = payload["say"].getStr()
     if '\n' in say or '\r' in say:
       raise newException(ChorusError, "say must be a single line")
-    if say.runeLen > MaxSayLen:
-      raise newException(ChorusError,
-        "say must be at most " & $MaxSayLen & " characters")
     result.say = say
   if payload.hasKey("notes"):
     if payload["notes"].kind != JString:
       raise newException(ChorusError, "notes must be a string")
-    let notes = payload["notes"].getStr()
-    if notes.runeLen > MaxNotesLen:
-      raise newException(ChorusError,
-        "notes must be at most " & $MaxNotesLen & " characters")
-    result.notes = notes
+    result.notes = payload["notes"].getStr()
 
 proc decideAll*(
   client: LlmClient,
