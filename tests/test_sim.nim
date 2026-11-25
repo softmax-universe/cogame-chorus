@@ -498,6 +498,11 @@ suite "endings and results":
     check outage.done
     check outage.reason == "transport_failure"
     check replayMatch(config, outage.events)[^1].reason == "transport_failure"
+    var regFail = initSim(config)
+    regFail.failEpisode("registration_failure")
+    check regFail.done
+    check regFail.reason == "registration_failure"
+    check replayMatch(config, regFail.events)[^1].reason == "registration_failure"
 
   test "the results shape is what the platform is promised":
     let config = fixtureConfig(bars = 6, seed = 16)

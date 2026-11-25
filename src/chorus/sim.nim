@@ -91,7 +91,7 @@ type
     turnsPlayed*: int
     phase*: Phase
     done*: bool
-    reason*: string                  ## "complete" | "deadline" | "action_failure" | "transport_failure"
+    reason*: string                  ## "complete" | "deadline" | "action_failure" | "transport_failure" | "registration_failure"
     events*: seq[GameEvent]
 
 # ---- Small helpers ----------------------------------------------------------
@@ -518,11 +518,12 @@ proc endEarly*(sim: var Sim) =
   sim.settle("deadline")
 
 proc failEpisode*(sim: var Sim, reason: string) =
-  ## End the episode explicitly and unscored when an LLM seat suffers a
-  ## transport outage or exhausts retries with an invalid action.
+  ## End the episode explicitly and unscored when a seat fails role
+  ## registration, suffers a transport outage, or exhausts retries with an
+  ## invalid action.
   if sim.done:
     return
-  if reason notin ["action_failure", "transport_failure"]:
+  if reason notin ["action_failure", "transport_failure", "registration_failure"]:
     raise newException(ChorusError, "invalid failure reason: " & reason)
   sim.settle(reason)
 

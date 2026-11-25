@@ -339,8 +339,8 @@ import json, sys
 stats = json.loads(open(sys.argv[1]).read())
 replay = json.loads(open(sys.argv[2]).read())
 bars = replay["results"]["bars"]
-assert stats["requests"] >= bars, f"expected >= {bars} learner HTTP turns, got {stats}"
-assert "0" in stats["slots"], f"expected slot 0 learner HTTP attribution, got {stats}"
+assert stats["requests"] == bars, f"expected == {bars} learner HTTP turns, got {stats}"
+assert stats["slots"] == ["0"], f"expected only slot 0 learner HTTP attribution, got {stats}"
 non_scripted_slot0 = [
     e for e in replay["events"]
     if e.get("kind") == "bar" and e.get("seat") == 0 and not e.get("scripted")

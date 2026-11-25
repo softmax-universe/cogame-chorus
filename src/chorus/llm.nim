@@ -45,6 +45,7 @@ type
     fkNone = "none"
     fkAction = "action_failure"
     fkTransport = "transport_failure"
+    fkRegistration = "registration_failure"
 
   Decision* = object
     target*: int
@@ -580,10 +581,12 @@ proc decideAll*(
   sim: Sim,
   seats: seq[int],
   prompts: seq[string],
-  scripted: seq[ScriptKind]
+  scripted: seq[ScriptKind],
+  registered: seq[bool] = @[]
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order. Explicitly scripted seats run
-  ## their selected baseline; LLM seats that lack credentials or fail both
+  ## their selected baseline; unregistered seats fail explicitly without
+  ## issuing any model request; LLM seats that lack credentials or fail both
   ## attempts return `failed = true` with preserved failure reason and raw
   ## reply (never falling back to a scripted baseline).
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
@@ -594,6 +597,15 @@ proc decideAll*(
   var failureKinds = newSeq[FailureKind](seats.len)
   var lastRawReplies = newSeq[string](seats.len)
   for index, seat in seats:
+    if registered.len > 0 and (seat < 0 or seat >= registered.len or not registered[seat]):
+      let reason = "seat " & $seat & " has not completed role registration"
+      echo "chorus llm: ", reason
+      result[index] = Decision(
+        failed: true,
+        failureKind: fkRegistration,
+        failureReason: reason
+      )
+      continue
     let kind = scripted[seat]
     if kind != skNone:
       result[index] = scriptedAction(sim, seat, kind)
