@@ -322,6 +322,30 @@
   },
   "player": [
     {
+      "id": "chorus-player",
+      "name": "Chorus Prompt Player",
+      "type": "player",
+      "description": "The reference Chorus policy: delivers its PLAYER_PROMPT (or a default composition strategy in words) to the game and spectates until the final frame. Every decision is made server-side by Claude from that prompt. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "image": "{{CHORUS_IMAGE}}",
+      "run": [
+        "/bin/chorus-player"
+      ],
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      },
+      "source_url": "https://github.com/softmax-universe/cogame-chorus/tree/main",
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      }
+    },
+    {
       "id": "chorus-arpeggio",
       "name": "Chorus Arpeggio Baseline",
       "type": "player",
@@ -477,13 +501,13 @@
     },
     "players": [
       {
+        "player_id": "chorus-player"
+      },
+      {
         "player_id": "chorus-arpeggio"
       },
       {
         "player_id": "chorus-pedal"
-      },
-      {
-        "player_id": "chorus-arpeggio"
       },
       {
         "player_id": "chorus-pedal"

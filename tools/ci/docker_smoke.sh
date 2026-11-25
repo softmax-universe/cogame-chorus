@@ -65,8 +65,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+fixture_pid=""
 
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then
+    kill "${fixture_pid}" >/dev/null 2>&1 || true
+    wait "${fixture_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,11 +196,38 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+fixture_stats=""
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(--add-host=host.docker.internal:host-gateway -e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: forwarding to game container"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  fixture_port_file="${work_dir}/fixture.port"
+  fixture_stats="${work_dir}/fixture.stats.json"
+  python3 "${script_dir}/llm_fixture.py" \
+    --host 0.0.0.0 --port 0 \
+    --port-file "${fixture_port_file}" \
+    --stats-file "${fixture_stats}" &
+  fixture_pid="$!"
+  for _ in $(seq 1 50); do
+    if [ -s "${fixture_port_file}" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  test -s "${fixture_port_file}" || { echo "FAIL: local LLM fixture did not start" >&2; exit 1; }
+  fixture_port="$(cat "${fixture_port_file}")"
+  game_env+=(
+    --add-host=host.docker.internal:host-gateway
+    -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}"
+    -e "COWORLD_LLM_MODEL=ci-deterministic-fixture"
+  )
+  echo "started deterministic local LLM fixture on port ${fixture_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
@@ -299,6 +331,25 @@ PY
 then
   dump_logs
   exit 1
+fi
+
+if [ -n "${fixture_stats}" ]; then
+  python3 - "${fixture_stats}" "${work_dir}/replay.json" <<'PY'
+import json, sys
+stats = json.loads(open(sys.argv[1]).read())
+replay = json.loads(open(sys.argv[2]).read())
+bars = replay["results"]["bars"]
+assert stats["requests"] >= bars, f"expected >= {bars} learner HTTP turns, got {stats}"
+assert "0" in stats["slots"], f"expected slot 0 learner HTTP attribution, got {stats}"
+non_scripted_slot0 = [
+    e for e in replay["events"]
+    if e.get("kind") == "bar" and e.get("seat") == 0 and not e.get("scripted")
+]
+assert len(non_scripted_slot0) == bars, (
+    f"expected {bars} applied non-scripted learner bars for slot 0, got {len(non_scripted_slot0)}"
+)
+print(f"learner HTTP turns verified: {stats['requests']} requests, {len(non_scripted_slot0)} applied slot-0 bars")
+PY
 fi
 
 # --------------------------------------------------------------------------
