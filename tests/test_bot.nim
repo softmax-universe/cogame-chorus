@@ -93,7 +93,11 @@ suite "scripted baselines":
     check highest <= 92.0
     check pedalLower.float / trials.float >= 0.9
 
-  test "decideAll falls back to scripted with no credentials":
+  test "decideAll fails non-scripted seats with no credentials instead of falling back":
+    for key in ["COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
+      delEnv(key)
     let config = fixture(3, bars = 6)
     let client = newLlmClient(config)
     check client.disabled
@@ -101,24 +105,27 @@ suite "scripted baselines":
     let seats = sim.pendingSeats()
     let decisions = client.decideAll(sim, seats,
       @["write a countermelody", "", "", ""],
-      @[skNone, skNone, skPedal, skNone])
+      @[skNone, skArpeggio, skPedal, skNone])
     check decisions.len == Seats
-    for index, seat in seats:
-      let kind = if seat == 2: skPedal else: skArpeggio
-      check decisions[index].steps == scriptedAction(sim, seat, kind).steps
-      check decisions[index].target == sim.turn
-      check decisions[index].scripted
-      ## Legal as-is: applyBar raises on anything else.
-      sim.applyBar(seat, decisions[index].target, decisions[index].steps,
-        "", "", decisions[index].scripted)
-    check sim.turn == 1
-    check sim.turnsPlayed == 1
+    check decisions[0].failed
+    check not decisions[0].scripted
+    check "unavailable" in decisions[0].failureReason
+    check decisions[3].failed
+    check not decisions[3].scripted
+    ## Explicitly scripted seats still run their selected baseline.
+    check not decisions[1].failed
+    check decisions[1].scripted
+    check decisions[1].steps == scriptedAction(sim, 1, skArpeggio).steps
+    check not decisions[2].failed
+    check decisions[2].scripted
+    check decisions[2].steps == scriptedAction(sim, 2, skPedal).steps
 
-  test "a seat that fails both attempts is recorded as scripted":
-    ## The retry-exhausted fallback must be distinguishable from a parsed
-    ## reply in the RECORDED bar, or phase 60 counts no fallbacks at all on a
-    ## live episode. Point an enabled client at a closed port so both
-    ## attempts fail on transport, fast and without a network.
+  test "a seat that fails both attempts returns explicit failure without fallback":
+    ## Point an enabled client at a closed port so both attempts fail on
+    ## transport, fast and without a network. No scripted fallback is synthesized.
+    for key in ["COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
+      delEnv(key)
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "unusable-in-tests")
     var config = fixture(7, bars = 6)
@@ -133,20 +140,12 @@ suite "scripted baselines":
       @[skNone, skNone, skNone, skNone])
     check decisions.len == Seats
     for index, seat in seats:
-      check decisions[index].scripted
-      check decisions[index].steps ==
-        scriptedAction(sim, seat, skArpeggio).steps
-      sim.applyBar(seat, decisions[index].target, decisions[index].steps,
-        decisions[index].say, decisions[index].notes,
-        decisions[index].scripted)
-    var bars = 0
-    for event in sim.events:
-      if event.kind == evBar:
-        bars.inc
-        check event.scripted
-    check bars == Seats
+      check decisions[index].failed
+      check not decisions[index].scripted
+      check decisions[index].failureReason.len > 0
+      check decisions[index].rawReply.len > 0
 
-  test "model replies parse tolerantly and reject the illegal ones":
+  test "model replies accept canonical JSON and outer markdown fence, and reject aliases/shims":
     let array16 = "[0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]"
     let want = @[0, -1, -1, 4, -1, -1, 2, -1, 0, -1, -1, 4, -1, -1, -1, -1]
     check parseDecision(parseJson("""{"target": 2, "steps": """ & array16 &
@@ -154,56 +153,91 @@ suite "scripted baselines":
     ## A parsed reply is the model's own bar, never a baseline.
     check not parseDecision(parseJson("""{"target": 2, "steps": """ &
       array16 & "}"), 3).scripted
-    ## The string form, space- and comma-separated, with every rest spelling.
-    check parseDecision(parseJson(
-      """{"steps": "0 . r 4 R rest - -1 0 . . 4 . . . ."}"""), 0).steps ==
-      @[0, -1, -1, 4, -1, -1, -1, -1, 0, -1, -1, 4, -1, -1, -1, -1]
-    check parseDecision(parseJson(
-      """{"steps": "0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1"}"""),
-      0).steps == want
-    ## Floats are rounded and numeric strings are accepted.
-    check parseDecision(parseJson(
-      """{"steps": [0.0,-1,-1,3.6,-1,-1,"2",-1,0,-1,-1,4,-1,-1,-1,-1]}"""),
-      0).steps == want
-    ## A missing target means this turn's new bar.
-    check parseDecision(parseJson("""{"steps": """ & array16 & "}"),
-      5).target == 5
     check parseDecision(parseJson("""{"target": 2, "steps": """ & array16 &
       "}"), 5).target == 2
-    ## Trailing prose after the closing brace is tolerated.
-    let messy = extractJsonObject("Sure! {\"target\": 0, \"steps\": " &
-      array16 & "} — I kept the tonic on 0 and 8.")
-    check parseDecision(messy, 0).steps == want
-    ## And the illegal ones are rejected before they touch the sim.
+    ## Standard outer Markdown JSON fence is supported.
+    let fencedJson = "```json\n{\"target\": 0, \"steps\": " & array16 & "}\n```"
+    check parseDecision(extractJsonObject(fencedJson), 0).steps == want
+    let fencedPlain = "```\n{\"target\": 0, \"steps\": " & array16 & "}\n```"
+    check parseDecision(extractJsonObject(fencedPlain), 0).steps == want
+    ## Leading or trailing prose outside the JSON object is rejected.
+    expect ChorusError:
+      discard extractJsonObject("Sure! {\"target\": 0, \"steps\": " &
+        array16 & "} — I kept the tonic on 0 and 8.")
+    expect ChorusError:
+      discard extractJsonObject("{\"target\": 0, \"steps\": " & array16 & "} trailing")
+    ## String-form steps, rest spellings, float rounding, string numbers, and null are rejected.
     expect ChorusError:
       discard parseDecision(parseJson(
-        """{"steps": [0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1]}"""), 0)
+        """{"target": 0, "steps": "0 . r 4 R rest - -1 0 . . 4 . . . ."}"""), 0)
     expect ChorusError:
       discard parseDecision(parseJson(
-        """{"steps": [0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1,-1]}"""), 0)
+        """{"target": 0, "steps": "0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1"}"""), 0)
     expect ChorusError:
       discard parseDecision(parseJson(
-        """{"steps": [14,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
+        """{"target": 0, "steps": [0.0,-1,-1,3.6,-1,-1,"2",-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
     expect ChorusError:
       discard parseDecision(parseJson(
-        """{"steps": [-2,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
+        """{"target": 0, "steps": [0,null,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
+    ## Missing, null, float, or string target is rejected (no implicit default).
+    expect ChorusError:
+      discard parseDecision(parseJson("""{"steps": """ & array16 & "}"), 5)
+    expect ChorusError:
+      discard parseDecision(parseJson("""{"target": null, "steps": """ & array16 & "}"), 5)
+    expect ChorusError:
+      discard parseDecision(parseJson("""{"target": 2.0, "steps": """ & array16 & "}"), 5)
+    expect ChorusError:
+      discard parseDecision(parseJson("""{"target": "2", "steps": """ & array16 & "}"), 5)
+    ## Out-of-bounds lengths, tokens, targets, and missing steps are rejected.
+    expect ChorusError:
+      discard parseDecision(parseJson(
+        """{"target": 0, "steps": [0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1]}"""), 0)
+    expect ChorusError:
+      discard parseDecision(parseJson(
+        """{"target": 0, "steps": [0,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1,-1]}"""), 0)
+    expect ChorusError:
+      discard parseDecision(parseJson(
+        """{"target": 0, "steps": [14,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
+    expect ChorusError:
+      discard parseDecision(parseJson(
+        """{"target": 0, "steps": [-2,-1,-1,4,-1,-1,2,-1,0,-1,-1,4,-1,-1,-1,-1]}"""), 0)
     expect ChorusError:
       discard parseDecision(parseJson("""{"target": 4, "steps": """ &
         array16 & "}"), 3)
     expect ChorusError:
       discard parseDecision(parseJson("""{"target": 0}"""), 0)
-    ## say and notes are capped on RUNE boundaries.
-    var long = ""
-    for index in 0 ..< 900:
-      long.add("音")
-    let body = "{\"steps\": " & array16 & ", \"say\": \"" & long &
-      "\", \"notes\": \"" & long & "\"}"
-    let capped = parseDecision(parseJson(body), 0)
-    check capped.say.runeLen == MaxSayLen
-    check capped.notes.runeLen == MaxNotesLen
-    check capped.say.validateUtf8() == -1
-    check capped.notes.validateUtf8() == -1
-    check parseScriptKind("1") == skArpeggio
+    ## Overlong say/notes and multiline say are rejected instead of silently truncated.
+    var longSay = ""
+    for index in 0 ..< MaxSayLen + 1:
+      longSay.add("音")
+    var longNotes = ""
+    for index in 0 ..< MaxNotesLen + 1:
+      longNotes.add("音")
+    expect ChorusError:
+      discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
+        ", \"say\": \"" & longSay & "\"}"), 0)
+    expect ChorusError:
+      discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
+        ", \"notes\": \"" & longNotes & "\"}"), 0)
+    expect ChorusError:
+      discard parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
+        ", \"say\": \"line1\\nline2\"}"), 0)
+    ## Exact-limit UTF-8 say/notes are accepted.
+    var exactSay = ""
+    for index in 0 ..< MaxSayLen:
+      exactSay.add("音")
+    var exactNotes = ""
+    for index in 0 ..< MaxNotesLen:
+      exactNotes.add("音")
+    let accepted = parseDecision(parseJson("{\"target\": 0, \"steps\": " & array16 &
+      ", \"say\": \"" & exactSay & "\", \"notes\": \"" & exactNotes & "\"}"), 0)
+    check accepted.say.runeLen == MaxSayLen
+    check accepted.notes.runeLen == MaxNotesLen
+    ## Canonical PLAYER_SCRIPTED values only; legacy aliases rejected.
     check parseScriptKind("arpeggio") == skArpeggio
     check parseScriptKind("pedal") == skPedal
     check parseScriptKind("") == skNone
+    check parseScriptKind("none") == skNone
+    for alias in ["1", "true", "yes", "drone", "unknown"]:
+      expect ChorusError:
+        discard parseScriptKind(alias)

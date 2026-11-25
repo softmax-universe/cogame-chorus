@@ -131,16 +131,21 @@ when isMainModule:
       response = %*{"response": $action}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let rawResponse = request["response"].getStr()
+      let action =
+        if languageMode: extractJsonObject(rawResponse)
+        else: parseJson(rawResponse)
       let seat = game.pendingSeats()[0]
       var payload = action
-      if not action.hasKey("steps"):
+      if not languageMode and not action.hasKey("steps"):
         var steps = newJArray()
         for step in 0 ..< Steps:
           steps.add(action["step_" & $step])
         payload = %*{"target": action["target"], "steps": steps,
           "say": "", "notes": ""}
       let parsed = parseDecision(payload, view.turn)
+      if not view.config.talk and parsed.say.len > 0:
+        raise newException(ChorusError, "say is disabled when talk is off")
       game.applyBar(seat, parsed.target, parsed.steps, parsed.say,
         parsed.notes, false)
       inc id

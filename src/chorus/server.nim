@@ -21,7 +21,7 @@
 ##                   {"type":"final","scores":[...],"voices":[...]}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":"arpeggio"}
 ##                   (max 4000 runes; scripted plays a built-in baseline for
-##                   that seat: "arpeggio" / "1", or "pedal")
+##                   that seat: "arpeggio" or "pedal")
 
 import
   std/[json, locks, os, sets, strutils, tables, times, unicode],
@@ -54,6 +54,7 @@ type
     started: bool
     finished: bool
     trajectory: DecisionTrajectory
+    failureReport: JsonNode
 
 var
   stateLock: Lock
@@ -192,12 +193,15 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
+  var failureData: string
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
     results = state.sim.resultsJson()
     replayData = state.replayPayload(results)
+    if not state.failureReport.isNil:
+      failureData = $state.failureReport
     # Seal private evidence before the result artifact can stop the game pod.
     state.trajectory.finishNativeTrajectory(state.sim)
 
@@ -234,6 +238,14 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     runtimeConfig.replayUri, replayData, "application/octet-stream",
     "COGAME_SAVE_REPLAY_METHOD"
   )
+  if failureData.len > 0:
+    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+    if failureUri.len > 0:
+      echo "chorus: writing player failure report"
+      writeArtifact(
+        failureUri, failureData, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
   ## Bounded shutdown grace: /healthz and /global keep answering while the
   ## runner finishes its post-start probes, then the process exits.
   echo "chorus: artifacts written; holding the server up for ",
@@ -345,40 +357,83 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## so the snapshot cannot go stale.
       let decisions = client.decideAll(simCopy, seats, prompts, scripted)
 
+      var turnFailed = false
       withLock stateLock:
+        var failedSeats = newJArray()
         for index, seat in seats:
+          if decisions[index].failed:
+            failedSeats.add(%*{
+              "seat": seat,
+              "policy": config.players[seat].name,
+              "reason": decisions[index].failureReason,
+              "raw_reply": decisions[index].rawReply
+            })
+        if failedSeats.len > 0:
+          turnFailed = true
           let decisionTurn = simCopy.turn
-          let decision = decisions[index]
-          ## Provenance rides in the decision: a seat whose two attempts
-          ## timed out or failed to parse comes back from `decideAll` as a
-          ## baseline bar, and only the decision knows that.
-          let wasScripted = decision.scripted
-          echo "chorus: turn ", state.sim.turn, " ", state.sim.names[seat],
-            " (", state.sim.voiceName(seat), ") writes bar ",
-            decision.target,
-            (if decision.say.len > 0: " says \"" & decision.say & "\""
-             else: ""),
-            " at ", (epochTime() - gameStart).int, "s"
-          var applied = decision
-          try:
-            state.sim.applyBar(seat, decision.target, decision.steps,
-              decision.say, decision.notes, wasScripted)
-          except ChorusError as error:
-            echo "chorus: reply rejected (", error.msg,
-              "); using the arpeggio fallback"
-            let fallback = scriptedAction(state.sim, seat, skArpeggio)
-            state.sim.applyBar(seat, fallback.target, fallback.steps, "", "",
-              true)
-            applied = fallback
-            applied.say = ""
-            applied.notes = ""
-            applied.scripted = true
+          echo "chorus: turn ", decisionTurn,
+            " aborted due to action failure (no scripted fallback): ",
+            $failedSeats
           if not state.trajectory.isNil:
-            let action = %*{"target": applied.target, "steps": applied.steps,
-              "say": (if config.talk: applied.say else: ""), "notes": applied.notes}
-            state.trajectory.recordAppliedDecision(config, decisionTurn, seat,
-              privateViews[index], action, applied.scripted, client.nativeAttempts[seat])
-        state.broadcastLocked()
+            for index, seat in seats:
+              if decisions[index].failed:
+                state.trajectory.recordFailedDecision(config, decisionTurn, seat,
+                  privateViews[index], client.nativeAttempts[seat],
+                  status = asRejected, terminal = true)
+              elif client.nativeAttempts[seat].len > 0:
+                state.trajectory.recordFailedDecision(config, decisionTurn, seat,
+                  privateViews[index], client.nativeAttempts[seat],
+                  status = asMissing, terminal = true)
+          state.failureReport = %*{
+            "reason": "action_failure",
+            "turn": decisionTurn,
+            "failures": failedSeats
+          }
+          state.sim.failAction()
+          state.broadcastLocked()
+        else:
+          for index, seat in seats:
+            let decisionTurn = simCopy.turn
+            let decision = decisions[index]
+            let wasScripted = decision.scripted
+            echo "chorus: turn ", state.sim.turn, " ", state.sim.names[seat],
+              " (", state.sim.voiceName(seat), ") writes bar ",
+              decision.target,
+              (if decision.say.len > 0: " says \"" & decision.say & "\""
+               else: ""),
+              " at ", (epochTime() - gameStart).int, "s"
+            try:
+              state.sim.applyBar(seat, decision.target, decision.steps,
+                decision.say, decision.notes, wasScripted)
+            except ChorusError as error:
+              turnFailed = true
+              echo "chorus: reply rejected (", error.msg,
+                "); ending episode with action_failure"
+              if not state.trajectory.isNil:
+                state.trajectory.recordFailedDecision(config, decisionTurn, seat,
+                  privateViews[index], client.nativeAttempts[seat],
+                  status = asRejected, terminal = true)
+              state.failureReport = %*{
+                "reason": "action_failure",
+                "turn": decisionTurn,
+                "failures": [{
+                  "seat": seat,
+                  "policy": config.players[seat].name,
+                  "reason": error.msg,
+                  "raw_reply": decision.rawReply
+                }]
+              }
+              state.sim.failAction()
+              break
+            if not state.trajectory.isNil:
+              let action = %*{"target": decision.target, "steps": decision.steps,
+                "say": (if config.talk: decision.say else: ""), "notes": decision.notes}
+              state.trajectory.recordAppliedDecision(config, decisionTurn, seat,
+                privateViews[index], action, decision.scripted, client.nativeAttempts[seat])
+          state.broadcastLocked()
+
+      if turnFailed:
+        break
 
       ## Pace between turns so spectators can read the bar that just landed.
       if config.turnDelayMs > 0:
@@ -519,10 +574,11 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skArpeggio
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or node.kind == JNull: skNone
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else:
+              raise newException(ChorusError,
+                "scripted must be \"arpeggio\", \"pedal\", or empty")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted

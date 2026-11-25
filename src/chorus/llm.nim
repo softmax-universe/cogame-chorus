@@ -7,20 +7,19 @@
 ## Decisions within a turn are simultaneous by rule, so all four requests go
 ## out as ONE parallel batch (curly.makeRequests); invalid replies are
 ## retried once as a smaller batch carrying an explicit hint, and anything
-## still failing plays the `arpeggio` baseline, which is legal by
-## construction.
+## still failing ends the episode with an explicit failure while preserving
+## the submitted raw data (no implicit scripted fallback).
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing.
+## Explicitly scripted seats (PLAYER_SCRIPTED=arpeggio|pedal) run their
+## selected baseline deterministically without calling an LLM.
 
 import
-  std/[json, math, options, os, strutils, times, unicode],
+  std/[json, options, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   sim,
@@ -47,10 +46,14 @@ type
     steps*: seq[int]
     say*: string
     notes*: string      ## "" when the reply carried none
-    scripted*: bool     ## true when a baseline produced this bar rather
-                        ## than a parsed model reply — including the
-                        ## fallback after the retry is exhausted. The
+    scripted*: bool     ## true ONLY when the seat explicitly selected a
+                        ## scripted baseline (`arpeggio` or `pedal`). The
                         ## replay's `bar.scripted` flag is this field.
+    failed*: bool       ## true when an LLM seat failed to produce a legal
+                        ## action (no credentials, transport error, or invalid
+                        ## reply after retry). Never falls back to scripted.
+    failureReason*: string
+    rawReply*: string   ## last raw reply/body preserved on failure
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -72,12 +75,17 @@ type
     disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"arpeggio" play the arpeggio
-  ## bot, "pedal" the pedal bot, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "arpeggio": skArpeggio
-  of "pedal", "drone": skPedal
-  else: skNone
+  ## Canonical PLAYER_SCRIPTED values: "" / "none" for LLM-driven seats,
+  ## "arpeggio" for the arpeggio baseline, "pedal" for the pedal baseline.
+  let cleaned = text.strip().toLowerAscii()
+  case cleaned
+  of "", "none": skNone
+  of "arpeggio": skArpeggio
+  of "pedal": skPedal
+  else:
+    raise newException(ChorusError,
+      "unknown PLAYER_SCRIPTED value: " & text &
+        " (expected arpeggio, pedal, or empty)")
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -163,7 +171,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "chorus llm: no LLM credentials; using scripted fallback"
+    echo "chorus llm: no LLM credentials configured"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -176,9 +184,8 @@ proc emptySteps(): seq[int] =
     result[index] = Rest
 
 proc arpeggioBar*(sim: Sim, voice, bar: int): seq[int] =
-  ## The strong baseline, and the fallback for a failed LLM seat: chord
-  ## tones spread across the voices, rotated a step each bar so the piece
-  ## never settles on the repetition floor.
+  ## The strong scripted baseline: chord tones spread across the voices,
+  ## rotated a step each bar so the piece never settles on the repetition floor.
   result = emptySteps()
   let root = sim.chords[bar]
   let tones = [clampToken(root), clampToken(root + 2), clampToken(root + 4)]
@@ -406,20 +413,41 @@ proc retryHint*(sim: Sim, reason: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc stripOuterJsonFence(text: string): string =
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let firstNl = trimmed.find('\n')
+  if firstNl < 0:
+    return trimmed
+  let header = trimmed[3 ..< firstNl].strip().toLowerAscii()
+  if header.len > 0 and header != "json":
+    return trimmed
+  if not trimmed.endsWith("```"):
+    return trimmed
+  let innerEnd = trimmed.len - 3
+  if innerEnd <= firstNl:
+    return trimmed
+  trimmed[firstNl + 1 ..< innerEnd].strip()
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose after the closing brace.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
+  ## Parses a single JSON object from a model response, accepting only
+  ## optional outer whitespace and a standard outer Markdown JSON fence.
+  let candidate = stripOuterJsonFence(text)
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
     var head = text.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
-    raise newException(ChorusError, "no JSON object in response: " &
+    raise newException(ChorusError, "response must be a single JSON object: " &
       head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  let parsed =
+    try:
+      parseJson(candidate)
+    except CatchableError as error:
+      raise newException(ChorusError, "invalid JSON object: " & error.msg)
+  if parsed.kind != JObject:
+    raise newException(ChorusError, "response must be a JSON object")
+  parsed
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -495,51 +523,18 @@ proc cleanText*(text: string, limit: int): string =
     return
   result = result.runeSubStr(0, limit - 1) & "…"
 
-proc parseStepToken(text: string): int =
-  ## One token of a string-form `steps` field. ".", "-", "r", "R" and "rest"
-  ## are all rests; anything else must be a number (floats are rounded).
-  let raw = text.strip()
-  if raw.len == 0:
-    raise newException(ChorusError, "empty step token")
-  case raw.toLowerAscii()
-  of ".", "-", "r", "rest":
-    return Rest
-  else:
-    discard
-  try:
-    return int(round(parseFloat(raw)))
-  except ValueError:
-    raise newException(ChorusError, "not a step token: " & raw)
-
 proc parseSteps*(node: JsonNode): seq[int] =
-  ## `steps` is normally a JSON array of 16 integers, but a model that has
-  ## been asked for a formal structure will sometimes hand back a string, or
-  ## an array of numeric strings, or floats. Normalising here — before
-  ## validation — is what keeps the fallback rate down.
+  ## `steps` must be a JSON array of exactly 16 integers, each -1 (rest) or
+  ## 0..13. No string splitting, rest spelling aliases, float rounding, or
+  ## null coercion.
   if node.isNil or node.kind == JNull:
     raise newException(ChorusError, "no steps in response")
-  var tokens: seq[string]
-  case node.kind
-  of JArray:
-    for item in node:
-      case item.kind
-      of JInt: result.add(int(item.getInt()))
-      of JFloat: result.add(int(round(item.getFloat())))
-      of JString: result.add(parseStepToken(item.getStr()))
-      of JNull: result.add(Rest)
-      else:
-        raise newException(ChorusError, "bad step value: " & $item)
-  of JString:
-    var text = node.getStr()
-    for bad in ["[", "]", "(", ")", "\n", "\t", ";", "|", ","]:
-      text = text.replace(bad, " ")
-    for piece in text.split(' '):
-      if piece.strip().len > 0:
-        tokens.add(piece)
-    for token in tokens:
-      result.add(parseStepToken(token))
-  else:
-    raise newException(ChorusError, "steps must be an array or a string")
+  if node.kind != JArray:
+    raise newException(ChorusError, "steps must be a JSON array of integers")
+  for item in node:
+    if item.kind != JInt:
+      raise newException(ChorusError, "every step must be an integer, got: " & $item)
+    result.add(int(item.getInt()))
   if result.len != Steps:
     raise newException(ChorusError,
       "steps must be exactly " & $Steps & " values, got " & $result.len)
@@ -549,32 +544,37 @@ proc parseSteps*(node: JsonNode): seq[int] =
         "every step is -1 (rest) or 0.." & $MaxToken & ", got " & $value)
 
 proc parseDecision*(payload: JsonNode, turn: int): Decision =
-  ## `target` may be an integer, a float or a numeric string; a MISSING
-  ## target means "this turn's new bar" (documented in the prompt).
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen)
-    .replace("\n", " ")
-  result.steps = parseSteps(payload{"steps"})
-  let node = payload{"target"}
-  var target = turn
-  if not node.isNil and node.kind != JNull:
-    case node.kind
-    of JInt:
-      target = int(node.getInt())
-    of JFloat:
-      target = int(round(node.getFloat()))
-    of JString:
-      let text = node.getStr().strip()
-      try:
-        target = int(round(parseFloat(text)))
-      except ValueError:
-        raise newException(ChorusError, "target is not a number: " & text)
-    else:
-      raise newException(ChorusError, "target must be a number: " & $node)
+  ## Parses a canonical Chorus action: required integer `target` in 0..turn,
+  ## required 16-integer `steps` array, and optional string `say` / `notes`
+  ## within their published rune limits.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(ChorusError, "decision must be a JSON object")
+  if not payload.hasKey("target") or payload["target"].kind != JInt:
+    raise newException(ChorusError, "target must be an integer in 0.." & $turn)
+  let target = int(payload["target"].getInt())
   if target < 0 or target > turn:
     raise newException(ChorusError,
       "target must be 0.." & $turn & ": " & $target)
   result.target = target
+  result.steps = parseSteps(payload{"steps"})
+  if payload.hasKey("say"):
+    if payload["say"].kind != JString:
+      raise newException(ChorusError, "say must be a string")
+    let say = payload["say"].getStr()
+    if '\n' in say or '\r' in say:
+      raise newException(ChorusError, "say must be a single line")
+    if say.runeLen > MaxSayLen:
+      raise newException(ChorusError,
+        "say must be at most " & $MaxSayLen & " characters")
+    result.say = say
+  if payload.hasKey("notes"):
+    if payload["notes"].kind != JString:
+      raise newException(ChorusError, "notes must be a string")
+    let notes = payload["notes"].getStr()
+    if notes.runeLen > MaxNotesLen:
+      raise newException(ChorusError,
+        "notes must be at most " & $MaxNotesLen & " characters")
+    result.notes = notes
 
 proc decideAll*(
   client: LlmClient,
@@ -583,19 +583,24 @@ proc decideAll*(
   prompts: seq[string],
   scripted: seq[ScriptKind]
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Never raises: any failure
-  ## falls back to the `arpeggio` baseline so the episode always advances.
-  ## `prompts` and `scripted` are indexed by SEAT.
+  ## One decision per seat in `seats`, in order. Explicitly scripted seats run
+  ## their selected baseline; LLM seats that lack credentials or fail both
+  ## attempts return `failed = true` with preserved failure reason and raw
+  ## reply (never falling back to a scripted baseline).
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var reasons = newSeq[string](seats.len)
+  var lastRawReplies = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skArpeggio else: kind))
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
+    elif client.disabled:
+      let reason = "LLM credentials unavailable for non-scripted seat " & $seat
+      echo "chorus llm: ", reason
+      result[index] = Decision(failed: true, failureReason: reason)
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -621,14 +626,22 @@ proc decideAll*(
       let seat = seats[index]
       var evidence: DecisionAttempt
       if capture: evidence = pendingEvidence[position]
+      lastRawReplies[index] =
+        if responses[position].response.body.len > 0:
+          responses[position].response.body
+        else:
+          responses[position].error
       try:
         if capture:
           evidence.receiveNativeResponse(responses[position].response,
             responses[position].error, latencyMs)
         let text = client.textOf(responses[position].response,
           responses[position].error, batch[position].url)
+        lastRawReplies[index] = text
         let payload = extractJsonObject(text)
         var decision = parseDecision(payload, sim.turn)
+        if not sim.config.talk and decision.say.len > 0:
+          raise newException(ChorusError, "say is disabled when talk is off")
         ## Reject illegal replies here so the retry carries the hint.
         var probe = sim
         probe.applyBar(seat, decision.target, decision.steps, decision.say,
@@ -636,12 +649,7 @@ proc decideAll*(
         if capture:
           evidence.parsedAction = %*{"target": decision.target, "steps": decision.steps,
             "say": (if sim.config.talk: decision.say else: ""), "notes": decision.notes}
-          evidence.accepted = payload{"steps"} == %decision.steps and
-            (not payload.hasKey("target") or payload["target"] == %decision.target) and
-            payload{"say"}.getStr() == evidence.parsedAction["say"].getStr() and
-            payload{"notes"}.getStr() == decision.notes
-          if not evidence.accepted:
-            evidence.rejectionReason = some("native parser normalized supplied action fields")
+          evidence.accepted = true
         result[index] = decision
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
@@ -653,5 +661,12 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "chorus llm: seat ", seat, " falling back to the arpeggio baseline"
-    result[index] = scriptedAction(sim, seat, skArpeggio)
+    let reason =
+      if reasons[index].len > 0: reasons[index]
+      else: "LLM client disabled before decision completed"
+    echo "chorus llm: seat ", seat, " failed without fallback: ", reason
+    result[index] = Decision(
+      failed: true,
+      failureReason: reason,
+      rawReply: lastRawReplies[index]
+    )

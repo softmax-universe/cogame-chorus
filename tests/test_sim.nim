@@ -457,7 +457,7 @@ suite "replay":
     check $frames[^1].tableStateJson() == $short.tableStateJson()
 
 suite "endings and results":
-  test "complete and deadline are the only two endings":
+  test "complete, deadline, and action_failure settle cleanly":
     let config = fixtureConfig(bars = 5, seed = 15)
     var full = initSim(config)
     for turn in 0 ..< 5:
@@ -466,7 +466,6 @@ suite "endings and results":
     check full.done
     check full.reason == "complete"
     check full.turnsPlayed == 5
-    check full.reason in ["complete", "deadline"]
     var early = initSim(config)
     early.writeAll(onlyAt([0, 4, 8, 12], 1))
     early.writeAll(onlyAt([2, 6, 10, 14], 3))
@@ -483,6 +482,18 @@ suite "endings and results":
     for seat in 0 ..< Seats:
       check abs(early.resultsJson()["scores"][seat].getFloat() -
         round6(credited[seat])) < 1e-9
+    var failed = initSim(config)
+    failed.writeAll(onlyAt([0, 4, 8, 12], 1))
+    failed.failAction()
+    check failed.done
+    check failed.reason == "action_failure"
+    check failed.turnsPlayed == 1
+    check failed.pendingSeats().len == 0
+    check failed.resultsJson()["reason"].getStr() == "action_failure"
+    let failedFrames = replayMatch(config, failed.events)
+    check failedFrames[^1].done
+    check failedFrames[^1].reason == "action_failure"
+    check failedFrames[^1].turnsPlayed == 1
 
   test "the results shape is what the platform is promised":
     let config = fixtureConfig(bars = 6, seed = 16)

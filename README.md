@@ -84,23 +84,19 @@ Two scripted baselines ship in the same image and are selected with `PLAYER_SCRI
 
 | value | baseline |
 |---|---|
-| `arpeggio` (or `1` / `true` / `yes`) | chord tones spread across the four voices on complementary steps, rotated a place each bar. The strong baseline, and the fallback for any seat whose reply fails twice. |
+| `arpeggio` | chord tones spread across the four voices on complementary steps, rotated a place each bar. The strong scripted baseline. |
 | `pedal` | the chord root on the downbeat and a fifth halfway through the odd bars. Always legal, far too thin to score. |
 
-They also play **every** seat when no LLM credentials are present, so an episode always completes
-and offline certification finishes in seconds.
+Non-scripted seats never implicitly fall back to a scripted baseline: if an LLM seat has no credentials or fails both attempts, the episode ends with `action_failure` and preserves the raw reply. Certification seats explicitly select baseline policies (`chorus-arpeggio` and `chorus-pedal`).
 
 ## The rules, in one screen
 
 - 4 seats, 4 voices (`Bass` 36, `Tenor` 48, `Alto` 60, `Soprano` 72), seeded permutation.
 - `bars` turns (default 8, range 4–16); every bar is 16 steps.
-- `target` must satisfy `0 ≤ target ≤ turn`; a missing `target` means this turn's new bar.
-- `steps` is exactly 16 tokens, each `-1` or `0..13`. A string of 16 whitespace- or
-  comma-separated tokens is also accepted, where `.`, `-`, `r`, `R` and `rest` all mean a rest.
-- `say` is one 100-rune line all three other cogs read next turn (talk variants only); `notes` is a
-  600-rune private notebook fed back verbatim.
-- Two endings and no others: `complete` (all bars written) and `deadline` (the play deadline was
-  crossed between turns; the piece is honestly scored on the bars actually written).
+- `target` is a required integer satisfying `0 ≤ target ≤ turn`.
+- `steps` is a required JSON array of exactly 16 integers, each `-1` or `0..13`. Model replies must be a single JSON object (optionally wrapped in a standard outer Markdown JSON fence).
+- `say` is an optional single-line string (max 100 runes) all three other cogs read next turn (talk variants only); `notes` is an optional private notebook (max 600 runes) fed back verbatim.
+- Endings: `complete` (all bars written), `deadline` (the play deadline was crossed between turns), or `action_failure` (a non-scripted seat failed to produce a legal action after retry).
 
 Full rules and the metric with worked examples are in the manifest's `rules.md` and `scoring.md`
 pages, and the design note is at `docs/plans/2026-08-24-chorus-design.md`.
